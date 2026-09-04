@@ -44,7 +44,9 @@
 - [Data & Storage](#data--storage)
 - [AI assistant (optional)](#ai-assistant-optional)
   - [About your API key](#about-your-api-key)
+  - [**🔑 Getting a free Gemini API key**](#-getting-a-free-gemini-api-key)
 - [Project Structure](#project-structure)
+- [Contributing](#contributing)
 - [License](#license)
 
 ## Features
@@ -504,6 +506,30 @@ key scoped or rate-limited to this use.
 
 AI output can be wrong. Treat it as a second opinion, not the final word.
 
+### 🔑 Getting a free Gemini API key
+
+Google AI Studio issues a free-tier key in about a minute, which makes **Google
+Gemini** the quickest provider to start with.
+
+1. Visit **[Google AI Studio](https://aistudio.google.com/app/apikey)**.
+2. Sign in with your Google account.
+3. Click **"Create API key"** and choose a new or existing Google Cloud project.
+4. Copy the key (it looks like `AIza…`) — it is only shown in full once.
+5. Back in DrillMCQ, open ⚙️ **Settings** in the header → **Configure AI
+   assistant**, pick **Google Gemini** as the provider, choose a model, paste
+   the key, and hit **Test connection**. A green dot on the settings button
+   means you are ready.
+
+The free tier is rate-limited rather than billed, so a burst of requests can
+come back as a `429` — wait a moment and retry, or add billing to the project in
+Google Cloud for higher limits. Paid keys from OpenAI or Anthropic work exactly
+the same way; only step 5 changes.
+
+Keep the key to yourself: it is a credential, not a setting. DrillMCQ sends it
+straight to Google from your browser and never stores it anywhere else — see
+[About your API key](#about-your-api-key) above for what "remember on this
+device" actually does.
+
 ## Project Structure
 
 ```text
@@ -567,6 +593,85 @@ src/
  ├── main.tsx
  └── index.css
 ```
+
+## Contributing
+
+Issues and pull requests are welcome at
+**[github.com/thealiflab/DrillMCQ](https://github.com/thealiflab/DrillMCQ)**.
+For anything larger than a bug fix, open an issue first so the approach can be
+agreed before you write the code.
+
+### Set up
+
+```bash
+# fork the repo on GitHub, then:
+git clone https://github.com/<your-username>/DrillMCQ.git
+cd DrillMCQ
+npm install
+npm run dev          # http://localhost:5173
+```
+
+### Before you open a PR
+
+All three must pass — the deploy workflow runs the build on every push to `main`:
+
+```bash
+npm run lint         # ESLint (typescript-eslint + react-hooks)
+npm test             # Vitest
+npm run build        # tsc -b (strict) + vite build
+```
+
+Components and hooks have no tests, so anything you change in the UI has to be
+driven in a browser. Say in the PR what you actually exercised.
+
+### House rules
+
+These are the constraints the project is built on, and what a review will check.
+[`CLAUDE.md`](CLAUDE.md) is the long-form architecture guide — read it first.
+
+- **No backend, no database.** Everything is client-side; persistence is
+  `localStorage` and only ever through `src/services/storage.ts`. Never touch
+  `localStorage` anywhere else.
+- **No new runtime dependencies** without discussing it first. The app ships
+  `react` + `react-dom` and nothing more.
+- **No binary assets.** There is no `public/` folder; sounds are synthesized
+  with the Web Audio API in `src/services/sound.ts`, the only module allowed to
+  create an `AudioContext`.
+- **TypeScript strict**, no `any` escape hatches, no `// @ts-expect-error` to
+  get a build green.
+- **Test the pure layer.** New logic in `src/utils/**` or
+  `src/services/storage.ts` needs tests; the Vitest environment is node with
+  **no DOM**, so keep that logic free of browser APIs and React.
+- **Storage shape changes** need a step in `migrate()` and a `SCHEMA_VERSION`
+  bump. Migrate in place under the same key whenever the normalizers can widen
+  the old shape — don't orphan people's saved quizzes and history.
+- **Question schema changes** go in three places together: `parseQuizJson` /
+  `normalizeQuestion` (`src/utils/quiz.ts`), `src/types/quiz.ts`, and the
+  [schema table](#quiz-json-schema) in this README.
+- **The AI layer is optional.** With AI disabled the app must behave exactly as
+  it did before that layer existed — that is the acceptance bar for any change
+  to it. AI never produces questions directly; it only writes text back into an
+  importer textarea for the normal parser to re-validate.
+- **Don't change `base: './'`** in `vite.config.ts` — the same build has to work
+  on GitHub Pages (`/DrillMCQ/`) and Vercel (`/`).
+
+### Commits and PRs
+
+Follow the existing history: `feat:`, `fix:`, `docs:`, `refactor:`, `chore:`
+prefixes, imperative mood, one logical change per commit. In the PR description
+say what changes for the user, and add before/after screenshots for anything
+visual.
+
+### Good first contributions
+
+- A new plain-text pattern from a real exam dump the parser mishandles — add
+  the case to `src/utils/parseMcqText.test.ts` alongside the fix.
+- A new `NOISE_RES` entry for website or PDF clutter that leaks into a paste
+  (anchored to the whole line, so real content can't match).
+- Keyboard and screen-reader fixes.
+- Documentation, including sample question banks.
+
+By contributing you agree that your work is licensed under the MIT license.
 
 ## License
 

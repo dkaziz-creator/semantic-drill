@@ -1,6 +1,6 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { HistoryStats, QuizAttempt, QuizSession } from '../types/quiz'
-import { appendAttempt, deleteAttempt, loadAttempts } from '../services/storage'
+import { appendAttempt, deleteAttempt, loadAttempts, subscribeStorage } from '../services/storage'
 import {
   attemptsForQuiz,
   computeHistoryStats,
@@ -18,6 +18,14 @@ export function useQuizHistory() {
   const refresh = useCallback(() => {
     setAttempts(loadAttempts())
   }, [])
+
+  useEffect(() => {
+    const unsubscribe = subscribeStorage((type) => {
+      if (type === 'attempt') refresh()
+    })
+    refresh() // include changes received between rendering and subscribing
+    return unsubscribe
+  }, [refresh])
 
   /**
    * Record a submitted session. Idempotent on the session's attempt id, so

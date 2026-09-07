@@ -17,7 +17,7 @@
 
 <p>
   DrillMCQ is a fully client-side quiz web app. You paste MCQs as plain text or JSON (either generated from LLMs or copied over from any sources), and it parses them into an interactive quiz simulator with shuffling, a timer, scoring, pass/fail thresholds, and per-question review. An optional bring-your-own-key AI assistant can format messy pastes, repair JSON, verify answers, and explain results.<br />
-  <strong>No backend, no database: everything runs in your browser.</strong>
+  <strong>Runs in your browser, with local learning storage and optional CouchDB sync.</strong>
 </p>
 
 </div>
@@ -67,7 +67,7 @@
 - **Quiz library**: save imported quizzes to your **Quiz Library**, with question count, categories, best score, attempts, and status (not started / in progress / completed). Rename, start over, view results, or delete from a per-card menu
 - **Resume**: leave or refresh mid-quiz and pick up from home or the library exactly where you left off, with answers, position, timer, and settings intact
 - **Results history**: every completed attempt is kept locally, on its own **Results** screen and per quiz, with latest / best / average scores and a full review of any past attempt
-- **Session persistence**: progress, answers, and timer survive a page refresh (localStorage)
+- **Session persistence**: progress, answers, and timer survive a page refresh (PouchDB/IndexedDB)
 - **Timer mode**: optional countdown that auto-submits when time runs out
 - **Shuffle**: optionally shuffle questions and/or options
 - **Category filtering**: pick which categories to include before starting
@@ -167,7 +167,7 @@ A full run through the app, in the order you meet it.
 - [Vite](https://vite.dev/) for dev server and builds
 - [Tailwind CSS v4](https://tailwindcss.com/) for styling
 - [Vitest](https://vitest.dev/) for unit tests
-- `localStorage` for persistence: **no backend, no database**
+- PouchDB/IndexedDB for learning data; `localStorage` for device preferences. Optional native CouchDB sync; no frontend server runtime.
 
 ## Getting Started
 
@@ -436,29 +436,114 @@ selected set is exactly the correct set. For correct answers `A, C`:
 
 ## Data & Storage
 
-Everything is stored in your browser's `localStorage` under versioned keys:
+Learning data live in the browser's **PouchDB/IndexedDB** database named
+`semantic-drill-learning`. Each saved quiz has a `quiz:<id>` document, each
+completed attempt has an `attempt:<id>` document, and the active session uses
+`session:active`. Documents wrap the existing domain objects with a type and
+insertion order; the library and history are not stored as giant array documents.
 
-| Key                            | Contents                             |
-| ------------------------------ | ------------------------------------ |
-| `drillmcq_active_session.v1`   | The in-progress quiz session         |
-| `drillmcq_saved_quizzes.v1`    | The **Quiz Library**                 |
-| `drillmcq_quiz_results.v1`     | Completed attempts (append-only)     |
-| `drillmcq.theme.v1`            | Dark/light preference                |
-| `drillmcq_appearance.v1`       | Font, text size and background preset |
-| `drillmcq_ai_prefs.v1`         | AI provider/model preference         |
-| `drillmcq_ai_key.v1`           | Your API key — **only** if you opt in |
-| `drillmcq_schema_version`      | Schema version used for migrations   |
+React still uses the synchronous API in `src/services/storage.ts`. Startup awaits
+`initializeStorage()` before mounting React. Reads return isolated memory
+snapshots; writes update memory immediately and queue individual database writes.
+Conflicting local writes retry against the current revision. Failed writes stay
+queued and retry while the tab remains open, with a visible saving warning.
+`flushStorage()` waits for pending local writes (it does not wait for remote sync).
+If IndexedDB cannot open, startup shows a retry message instead of an empty app.
 
-The current schema version is **4**. Upgrading from an older version rewrites
-stored questions and answers into the multi-answer shape, gives an in-progress
-run its (empty) set of checked questions, and fills in the default 70% pass mark
-on runs and results recorded before that setting existed — all in place, so
-saved quizzes, an unfinished run, and your results history survive the upgrade.
+Small device preferences remain in `localStorage`:
 
-Nothing is ever sent to a server. Clearing site data clears your quizzes and
-history. Corrupted records are repaired or dropped on load rather than crashing
-the app, and if `localStorage` is full or blocked the app still runs, it just
-stops persisting.
+| Key | Contents |
+| --- | --- |
+| `drillmcq.theme.v1` | Dark/light preference |
+| `drillmcq_appearance.v1` | Font, text size and background preset |
+| `drillmcq_sound.v1` | Sound preference |
+| `drillmcq_ai_prefs.v1` | AI provider/model preferences |
+| `drillmcq_ai_key.v1` | API key, only when explicitly remembered |
+| `drillmcq_schema_version` | Domain schema metadata (currently **4**) |
+
+**Preferences and the AI API key are never put into PouchDB or CouchDB.** A full
+or blocked `localStorage` no longer prevents quizzes, history or progress from
+being saved in IndexedDB.
+
+### Existing browser data
+
+The first successful bootstrap imports valid records from
+`drillmcq_saved_quizzes.v1`, `drillmcq_quiz_results.v1` and
+`drillmcq_active_session.v1`. Pre-library sessions under `drillmcq.session.v1` are
+also recognized when the old schema indicates that migration is still needed.
+The existing normalizers upgrade single-answer questions and answers, checked
+question sets, progress and pass marks. Invalid entries are skipped individually;
+malformed JSON does not crash startup.
+
+Legacy learning keys are **left untouched**, including corrupt values. The local
+PouchDB marker `_local/learning-localstorage-v1` is written only after every import
+write succeeds. Stable IDs prevent duplicates after an interrupted import;
+existing documents and tombstones take precedence. The marker does not replicate,
+so each browser can migrate its own data. Blocked legacy storage defers the marker
+until a later startup. Once migrated, the old keys are backups, not current data;
+deleting a quiz or result will not reimport it on refresh.
+
+Migration is limited to the **same browser origin** (scheme, host and port).
+Copying `dist/` to a different origin does not copy data from the old origin.
+Clearing site data removes both the IndexedDB database and device preferences.
+
+### Optional CouchDB synchronization and manual release
+
+With `VITE_COUCHDB_URL` unset or blank, storage is entirely local and requires no
+CouchDB connection. Once the frontend is loaded, quiz use and local persistence
+work offline. This change does not add a service worker to cache the frontend
+itself for offline page loads.
+
+For a future release, copy `.env.example` to `.env.local` and set the **public,
+browser-facing database endpoint**, for example:
+
+```dotenv
+VITE_COUCHDB_URL=/couchdb/semantic-drill
+```
+
+That example path must be replaced by the endpoint you actually provide. An
+absolute HTTP(S) database URL is also accepted. Relative URLs resolve against
+the page URL. This is a **build-time** Vite setting: rebuild after changing it.
+Vite variables are visible in the bundle; never put passwords, API keys, tokens,
+or admin credentials in them. URLs containing credentials, query parameters or
+fragments are rejected, leaving local storage usable.
+
+The client starts native `db.sync(remote, { live: true, retry: true })` after local
+bootstrap. It does not wait for the network before opening the app. Incoming
+changes refresh the memory cache, library and history. An actively answered quiz
+is not replaced mid-question by incoming session changes; the stored session is
+loaded on the next page load.
+
+Manual prerequisites for enabling sync:
+
+- Provide an existing CouchDB database behind a browser-accessible endpoint. The
+  client does not create remote databases (`skip_setup: true`).
+- Arrange access control at the server/proxy. This iteration implements no login
+  or per-user database isolation; clients pointing at one endpoint share its data.
+- Prefer a same-origin reverse proxy. A different origin needs CouchDB CORS for
+  the frontend origin; an HTTPS frontend needs an HTTPS remote endpoint.
+- Serve the static `dist/` directory over HTTP(S), preserving a stable origin so
+  browser data survives later releases. No Node process is needed to serve it.
+
+Build, then optionally package for your separate manual deployment:
+
+```bash
+npm test
+npm run lint
+npm run build
+tar -C dist -czf semantic-drill-<version>.tar.gz .
+```
+
+Operational limits: the cache still loads learning records into memory at startup,
+so very large histories increase startup time and memory use. IndexedDB has a
+browser-managed quota and can be cleared/evicted; it is not a backup. An abrupt
+close before queued writes commit can lose the latest changes. Quiz deletion and
+reference cleanup span several documents and are not an atomic transaction.
+Concurrent offline edits use PouchDB/CouchDB's winning revision, without custom
+conflict merging; use one device/tab at a time for the shared active session.
+Live HTTP sync must be verified against the actual endpoint during deployment;
+normal tests use IndexedDB and a local PouchDB replication peer, not a CouchDB
+server. No deployment or server configuration is performed by this storage change.
 
 ## AI assistant (optional)
 
@@ -572,7 +657,8 @@ src/
  │    ├── useBusyAction.ts     # Busy state for a one-shot async action
  │    └── useAI.ts             # AI config, key, and request lifecycle
  ├── services/
- │    ├── storage.ts           # localStorage wrapper + migration
+ │    ├── storage.ts           # Synchronous storage API + legacy normalization
+ │    ├── learningDatabase.ts  # PouchDB cache, persistence and optional sync
  │    └── ai/                  # Provider-agnostic AI transport
  │         ├── aiService.ts    # Facade: send, normalize, redact keys
  │         ├── models.ts       # Curated model catalog per provider
@@ -629,11 +715,10 @@ driven in a browser. Say in the PR what you actually exercised.
 These are the constraints the project is built on, and what a review will check.
 [`CLAUDE.md`](CLAUDE.md) is the long-form architecture guide — read it first.
 
-- **No backend, no database.** Everything is client-side; persistence is
-  `localStorage` and only ever through `src/services/storage.ts`. Never touch
-  `localStorage` anywhere else.
-- **No new runtime dependencies** without discussing it first. The app ships
-  `react` + `react-dom` and nothing more.
+- **Static frontend.** Learning persistence uses PouchDB/IndexedDB with optional
+  CouchDB sync; device preferences use `localStorage`. React accesses both only
+  through `src/services/storage.ts`. Keep AI keys out of learning documents.
+- **No new runtime dependencies** without discussing it first.
 - **No binary assets.** There is no `public/` folder; sounds are synthesized
   with the Web Audio API in `src/services/sound.ts`, the only module allowed to
   create an `AudioContext`.
@@ -642,9 +727,9 @@ These are the constraints the project is built on, and what a review will check.
 - **Test the pure layer.** New logic in `src/utils/**` or
   `src/services/storage.ts` needs tests; the Vitest environment is node with
   **no DOM**, so keep that logic free of browser APIs and React.
-- **Storage shape changes** need a step in `migrate()` and a `SCHEMA_VERSION`
-  bump. Migrate in place under the same key whenever the normalizers can widen
-  the old shape — don't orphan people's saved quizzes and history.
+- **Storage shape changes** need compatible normalizers and a `SCHEMA_VERSION`
+  bump. Keep document identities stable and preserve people's saved quizzes and
+  history. The localStorage import marker is separate from the domain schema.
 - **Question schema changes** go in three places together: `parseQuizJson` /
   `normalizeQuestion` (`src/utils/quiz.ts`), `src/types/quiz.ts`, and the
   [schema table](#quiz-json-schema) in this README.

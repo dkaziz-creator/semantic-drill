@@ -26,7 +26,7 @@ interface SettingsDialogProps {
   /** One line describing the assistant's current state. */
   aiStatus: string
   onOpenAI: () => void
-  /** False when the browser is blocking localStorage. */
+  /** False when learning-data persistence is unavailable. */
   storageAvailable: boolean
   onClose: () => void
 }
@@ -247,8 +247,8 @@ export function SettingsDialog({
 
         <p className="text-xs text-slate-500 dark:text-slate-400">
           {storageAvailable
-            ? 'Quizzes, results and preferences are stored in this browser only. Clearing site data removes them.'
-            : 'This browser is blocking local storage, so quizzes and results cannot be saved.'}
+            ? 'Quizzes and results are saved in this browser and may sync if a remote database is configured. Preferences and your AI key stay on this device. Clearing site data removes local copies.'
+            : 'Changes could not be saved in this browser. Keep this tab open while saving retries.'}
         </p>
       </div>
     </Modal>

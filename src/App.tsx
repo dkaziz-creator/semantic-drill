@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { AIAnswerExplanation } from './components/AIAnswerExplanation'
 import { AIBusyOverlay } from './components/AIBusyOverlay'
 import { AISettings } from './components/AISettings'
@@ -27,7 +27,7 @@ import { useTheme } from './hooks/useTheme'
 import { useTimer } from './hooks/useTimer'
 import { PROVIDERS } from './services/ai/models'
 import { isSoundSupported, playSound } from './services/sound'
-import { isStorageAvailable } from './services/storage'
+import { isStorageAvailable, subscribeStorage } from './services/storage'
 import type { AIRequestKind } from './types/ai'
 import type { View } from './types/navigation'
 import type { QuizAttempt, QuizQuestion, QuizSession, SavedQuiz } from './types/quiz'
@@ -76,7 +76,7 @@ export default function App() {
   // Which saved quiz's history is open, and which attempt is being reviewed.
   const [historyQuizId, setHistoryQuizId] = useState<string | null>(null)
   const [reviewAttempt, setReviewAttempt] = useState<QuizAttempt | null>(null)
-  const [storageAvailable] = useState(isStorageAvailable)
+  const storageAvailable = useSyncExternalStore(subscribeStorage, isStorageAvailable)
   // Checks for the constructor only — asking never creates an AudioContext.
   const [soundSupported] = useState(isSoundSupported)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -297,11 +297,18 @@ export default function App() {
     </>
   )
 
+  const storageWarning = !storageAvailable && (
+    <p role="alert" className="bg-amber-100 px-4 py-3 text-center text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-200">
+      Changes could not be saved in this browser. Keep this tab open while saving retries.
+    </p>
+  )
+
   // While a quiz is being answered the app navigation is replaced by the
   // quiz's own compact bar, so nothing invites an accidental exit.
   if (activeSession !== null) {
     return (
       <div className="min-h-screen">
+        {storageWarning}
         <ActiveQuiz session={activeSession} quiz={quiz} onExit={handleExitQuiz} />
         {dialogs}
       </div>
@@ -310,6 +317,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen">
+      {storageWarning}
       <AppNav
         view={view}
         onNavigate={navigate}

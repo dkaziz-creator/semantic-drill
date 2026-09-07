@@ -9,7 +9,7 @@ interface SaveQuizPanelProps {
   savedName: string | null
   onSave: (name: string) => void
   onUpdate: (quizId: string) => void
-  /** False when localStorage is unavailable — saving wouldn't survive. */
+  /** False when learning-data persistence is unavailable. */
   storageAvailable: boolean
 }
 
@@ -56,8 +56,8 @@ export function SaveQuizPanel({
         role="status"
         className="rounded-2xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/50 dark:text-amber-400"
       >
-        Your browser is blocking local storage, so quizzes can't be saved to the library. You can
-        still take this quiz now.
+        Your browser could not save changes to the library. Keep this tab open while saving retries.
+        You can still take this quiz now.
       </div>
     )
   }

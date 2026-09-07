@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { QuizAttempt, QuizQuestion, QuizSession, SavedQuiz } from '../types/quiz'
 import {
   deleteSavedQuiz,
@@ -6,6 +6,7 @@ import {
   loadSavedQuizzes,
   patchSavedQuiz,
   upsertSavedQuiz,
+  subscribeStorage,
 } from '../services/storage'
 import {
   attemptToQuestionBank,
@@ -25,7 +26,7 @@ export interface SaveAttemptResult {
  * The user's local quiz library.
  *
  * Every mutation writes through `services/storage` and adopts the list that
- * comes back, so React state and localStorage can't drift apart.
+ * comes back, so React state and the storage cache can't drift apart.
  */
 export function useSavedQuizzes() {
   const [quizzes, setQuizzes] = useState<SavedQuiz[]>(() => loadSavedQuizzes())
@@ -34,6 +35,14 @@ export function useSavedQuizzes() {
   const refresh = useCallback(() => {
     setQuizzes(loadSavedQuizzes())
   }, [])
+
+  useEffect(() => {
+    const unsubscribe = subscribeStorage((type) => {
+      if (type === 'quiz') refresh()
+    })
+    refresh() // include changes received between rendering and subscribing
+    return unsubscribe
+  }, [refresh])
 
   /** Save an imported quiz as a new library entry. Returns the new record. */
   const saveQuiz = useCallback((name: string, questions: QuizQuestion[]): SavedQuiz => {

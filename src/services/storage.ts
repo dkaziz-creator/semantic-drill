@@ -12,14 +12,19 @@ import type { SoundPrefs } from '../types/sound'
 import { clampFontScale } from '../utils/appearance'
 import { normalizePassPercentage, normalizeQuestion } from '../utils/quiz'
 import { defaultSoundPrefs } from '../utils/sound'
+import {
+  LearningStore,
+  openLearningDatabase,
+  type LearningDatabase,
+  type LearningDocument,
+  type StorageChange,
+  type StoredLearningDocument,
+} from './learningDatabase'
 
 /**
- * Thin wrapper around localStorage so persistence logic lives in one place
- * and the rest of the app never touches storage keys directly.
- *
- * Everything here is defensive: localStorage can be missing (SSR, sandboxed
- * iframe), blocked (private mode), full (quota), or hold data written by an
- * older version of the app. No read or write is allowed to throw.
+ * The app's storage seam: small device preferences stay in localStorage;
+ * learning data use a synchronous memory cache backed by PouchDB/IndexedDB.
+ * initializeStorage() must finish before rendering any learning-data consumer.
  */
 
 const SCHEMA_VERSION_KEY = 'drillmcq_schema_version'
@@ -50,7 +55,7 @@ const SOUND_KEY = 'drillmcq_sound.v1'
 const AI_PREFS_KEY = 'drillmcq_ai_prefs.v1'
 const AI_KEY_KEY = 'drillmcq_ai_key.v1'
 
-/** Pre-library session key. Migrated into SESSION_KEY, then left in place. */
+/** Pre-library session key. Imported into PouchDB, then left in place. */
 const LEGACY_SESSION_KEY = 'drillmcq.session.v1'
 
 /** Bump when a stored shape changes, and add a step to `migrate` below. */
@@ -126,12 +131,9 @@ function writeJson(key: string, value: unknown): boolean {
   }
 }
 
-/** True when values written here will actually survive a refresh. */
+/** Whether learning-data persistence is currently healthy (independent of preferences). */
 export function isStorageAvailable(): boolean {
-  const probe = '__drillmcq_probe__'
-  if (!writeRaw(probe, '1')) return false
-  removeRaw(probe)
-  return true
+  return learning?.available ?? false
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +431,7 @@ function normalizeSoundPrefs(value: unknown): SoundPrefs {
 // Ids and fingerprints
 // ---------------------------------------------------------------------------
 
-/** Collision-resistant enough for keys that never leave this browser. */
+/** Stable document identities, including across independently created databases. */
 export function createId(prefix: string): string {
   try {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -461,69 +463,110 @@ export function fingerprintQuestions(questions: QuizQuestion[]): string {
 // Migration
 // ---------------------------------------------------------------------------
 
-let migrated = false
+let learning: LearningStore | null = null
+let bootstrapping: Promise<void> | null = null
+const listeners = new Set<(type: StorageChange) => void>()
 
-/**
- * Bring storage up to `SCHEMA_VERSION`. Runs at most once per page load and
- * is called by every public read so no caller can see pre-migration data.
- */
+/** Incoming database changes and persistence health, without exposing PouchDB to React. */
+export function subscribeStorage(listener: (type: StorageChange) => void): () => void {
+  listeners.add(listener)
+  return () => { listeners.delete(listener) }
+}
+
+function learningStore(): LearningStore {
+  if (!learning) throw new Error('Await initializeStorage() before using learning storage.')
+  return learning
+}
+
+function normalizeDocument(raw: PouchDB.Core.ExistingDocument<StoredLearningDocument>): LearningDocument | null {
+  const order = typeof raw.order === 'number' && Number.isFinite(raw.order) ? raw.order : 0
+  if (raw.type === 'quiz') {
+    const value = normalizeSavedQuiz(raw.value)
+    if (value && raw._id === `quiz:${value.id}`) return { _id: raw._id, order, type: 'quiz', value }
+  } else if (raw.type === 'attempt') {
+    const value = normalizeAttempt(raw.value)
+    if (value && raw._id === `attempt:${value.id}`) return { _id: raw._id, order, type: 'attempt', value }
+  } else if (raw.type === 'session' && raw._id === 'session:active') {
+    const value = normalizeSession(raw.value)
+    if (value) return { _id: raw._id, order, type: 'session', value }
+  }
+  return null
+}
+
+/** Read a legacy snapshot without rewriting or deleting even corrupt entries. */
+function readLegacyLearning(): LearningDocument[] | null {
+  const source = store()
+  if (!source) return null
+  const parse = (raw: string | null): unknown => {
+    try { return raw === null ? null : JSON.parse(raw) } catch { return null }
+  }
+  try {
+    const rawSession = source.getItem(SESSION_KEY)
+    const version = Number(source.getItem(SCHEMA_VERSION_KEY) ?? '0')
+    const session = normalizeSession(parse(rawSession ?? (
+      version < 1 ? source.getItem(LEGACY_SESSION_KEY) : null
+    )))
+    const quizzes = normalizeList(parse(source.getItem(SAVED_QUIZZES_KEY)), normalizeSavedQuiz)
+    const attempts = normalizeList(parse(source.getItem(RESULTS_KEY)), normalizeAttempt)
+    const documents: LearningDocument[] = []
+    let order = 0
+    for (const value of quizzes) documents.push({ _id: `quiz:${value.id}`, type: 'quiz', value, order: ++order })
+    for (const value of attempts) documents.push({ _id: `attempt:${value.id}`, type: 'attempt', value, order: ++order })
+    if (session) documents.push({ _id: 'session:active', type: 'session', value: session, order: ++order })
+    return documents
+  } catch {
+    return null // blocked reads: defer the migration marker until a later startup
+  }
+}
+
+/** Domain schema metadata; normalization happens during the database import/load. */
 export function migrate(): void {
-  if (migrated) return
-  migrated = true
-  if (!store()) return
-
-  const storedVersion = Number(readRaw(SCHEMA_VERSION_KEY) ?? '0')
-  if (storedVersion >= SCHEMA_VERSION) return
-
-  // v0 -> v1: the session moved from `drillmcq.session.v1` to its own
-  // namespaced key. Copy it across so an in-progress quiz survives the
-  // upgrade; the legacy key is left untouched in case the user rolls back.
-  if (storedVersion < 1 && readRaw(SESSION_KEY) === null) {
-    const legacy = readJson(LEGACY_SESSION_KEY, normalizeSession)
-    if (legacy) writeJson(SESSION_KEY, legacy)
+  if (Number(readRaw(SCHEMA_VERSION_KEY) ?? '0') < SCHEMA_VERSION) {
+    writeRaw(SCHEMA_VERSION_KEY, String(SCHEMA_VERSION))
   }
+}
 
-  // v1 -> v2: questions gained `correctAnswers: string[]` in place of
-  // `correctAnswer: string`, and answers became arrays. The normalizers read
-  // both shapes, so upgrading is a read-and-write-back through them — the keys
-  // themselves stay put, which is what keeps existing libraries and history
-  // intact instead of orphaning them behind a new suffix.
-  if (storedVersion < 2) {
-    const session = readJson(SESSION_KEY, normalizeSession)
-    if (session) writeJson(SESSION_KEY, session)
-    const quizzes = readJson(SAVED_QUIZZES_KEY, (v) => normalizeList(v, normalizeSavedQuiz))
-    if (quizzes) writeJson(SAVED_QUIZZES_KEY, quizzes)
-    const attempts = readJson(RESULTS_KEY, (v) => normalizeList(v, normalizeAttempt))
-    if (attempts) writeJson(RESULTS_KEY, attempts)
+/** One shared bootstrap promise prevents concurrent callers from seeing a partial cache. */
+export function initializeStorage(options: { database?: LearningDatabase; remoteUrl?: string } = {}): Promise<void> {
+  if (bootstrapping) return bootstrapping
+  bootstrapping = (async () => {
+    const next = new LearningStore(options.database ?? openLearningDatabase(), normalizeDocument, (type) => {
+      for (const listener of listeners) listener(type)
+    })
+    try {
+      let imported = false
+      await next.initialize(() => {
+        const legacy = readLegacyLearning()
+        imported = legacy !== null
+        return legacy
+      })
+      learning = next
+      if (imported) migrate()
+      next.startSync(options.remoteUrl)
+    } catch (error) {
+      await next.close().catch(() => undefined)
+      throw error
+    }
+  })().catch((error: unknown) => {
+    bootstrapping = null
+    throw error
+  })
+  return bootstrapping
+}
+
+export async function flushStorage(): Promise<void> {
+  await learningStore().flush()
+}
+
+/** Close only after flushing pending writes; a later bootstrap reopens persisted data. */
+export async function closeStorage(): Promise<void> {
+  await bootstrapping?.catch(() => undefined)
+  try {
+    await learning?.close()
+  } finally {
+    learning = null
+    bootstrapping = null
   }
-
-  // v2 -> v3: a session (and a saved quiz's progress snapshot) gained
-  // `revealed`, the set of questions checked mid-quiz. An older run has none,
-  // which `normalizeIdList` supplies, so this is another read-and-write-back
-  // under the same keys — no library or history is orphaned. Attempts are
-  // untouched: a finished attempt never carried reveals.
-  if (storedVersion < 3) {
-    const session = readJson(SESSION_KEY, normalizeSession)
-    if (session) writeJson(SESSION_KEY, session)
-    const quizzes = readJson(SAVED_QUIZZES_KEY, (v) => normalizeList(v, normalizeSavedQuiz))
-    if (quizzes) writeJson(SAVED_QUIZZES_KEY, quizzes)
-  }
-
-  // v3 -> v4: `QuizSettings` gained `passPercentage`. `normalizeSettings`
-  // supplies the default for a record written without one, so this is a third
-  // read-and-write-back under the same keys. Attempts are included this time:
-  // unlike `revealed`, the pass mark is what a stored result is judged against
-  // when it is replayed on the result screen.
-  if (storedVersion < 4) {
-    const session = readJson(SESSION_KEY, normalizeSession)
-    if (session) writeJson(SESSION_KEY, session)
-    const quizzes = readJson(SAVED_QUIZZES_KEY, (v) => normalizeList(v, normalizeSavedQuiz))
-    if (quizzes) writeJson(SAVED_QUIZZES_KEY, quizzes)
-    const attempts = readJson(RESULTS_KEY, (v) => normalizeList(v, normalizeAttempt))
-    if (attempts) writeJson(RESULTS_KEY, attempts)
-  }
-
-  writeRaw(SCHEMA_VERSION_KEY, String(SCHEMA_VERSION))
 }
 
 // ---------------------------------------------------------------------------
@@ -531,18 +574,17 @@ export function migrate(): void {
 // ---------------------------------------------------------------------------
 
 export function saveSession(session: QuizSession): void {
-  migrate()
-  writeJson(SESSION_KEY, session)
+  const value = normalizeSession(session)
+  if (value) learningStore().set('session:active', { type: 'session', value })
 }
 
 export function loadSession(): QuizSession | null {
-  migrate()
-  return readJson(SESSION_KEY, normalizeSession)
+  const document = learningStore().get('session:active')
+  return document?.type === 'session' ? document.value : null
 }
 
 export function clearSession(): void {
-  migrate()
-  removeRaw(SESSION_KEY)
+  learningStore().remove('session:active')
 }
 
 // ---------------------------------------------------------------------------
@@ -550,47 +592,32 @@ export function clearSession(): void {
 // ---------------------------------------------------------------------------
 
 export function loadSavedQuizzes(): SavedQuiz[] {
-  migrate()
-  const list = readJson(SAVED_QUIZZES_KEY, (value) => normalizeList(value, normalizeSavedQuiz))
-  return list ?? []
+  return learningStore().list('quiz').flatMap((doc) => doc.type === 'quiz' ? [doc.value] : [])
 }
 
-function writeSavedQuizzes(quizzes: SavedQuiz[]): boolean {
-  return writeJson(SAVED_QUIZZES_KEY, quizzes)
-}
-
-/**
- * Insert or replace a saved quiz, returning the full library so callers can
- * refresh their state from a single round trip.
- */
+/** Insert or replace one quiz, immediately returning the updated library. */
 export function upsertSavedQuiz(quiz: SavedQuiz): SavedQuiz[] {
-  const quizzes = loadSavedQuizzes()
-  const index = quizzes.findIndex((q) => q.id === quiz.id)
-  if (index === -1) quizzes.push(quiz)
-  else quizzes[index] = quiz
-  writeSavedQuizzes(quizzes)
-  return quizzes
+  const value = normalizeSavedQuiz(quiz)
+  if (value) learningStore().set(`quiz:${value.id}`, { type: 'quiz', value })
+  return loadSavedQuizzes()
 }
 
 /** Apply a change to one saved quiz. No-op when the id is unknown. */
-export function patchSavedQuiz(
-  id: string,
-  patch: (quiz: SavedQuiz) => SavedQuiz,
-): SavedQuiz[] {
-  const quizzes = loadSavedQuizzes()
-  const index = quizzes.findIndex((q) => q.id === id)
-  if (index === -1) return quizzes
-  quizzes[index] = patch(quizzes[index])
-  writeSavedQuizzes(quizzes)
-  return quizzes
+export function patchSavedQuiz(id: string, patch: (quiz: SavedQuiz) => SavedQuiz): SavedQuiz[] {
+  const document = learningStore().get(`quiz:${id}`)
+  if (document?.type !== 'quiz') return loadSavedQuizzes()
+  const updated = patch(document.value)
+  if (updated.id !== id) learningStore().remove(`quiz:${id}`)
+  return upsertSavedQuiz(updated)
 }
 
-/** Delete a saved quiz *and* its attempt history — they're worthless alone. */
+/** Delete a saved quiz and its attempt history, preserving other quizzes/results. */
 export function deleteSavedQuiz(id: string): SavedQuiz[] {
-  const quizzes = loadSavedQuizzes().filter((q) => q.id !== id)
-  writeSavedQuizzes(quizzes)
-  writeAttempts(loadAttempts().filter((a) => a.quizId !== id))
-  return quizzes
+  learningStore().remove(`quiz:${id}`)
+  for (const attempt of loadAttempts()) {
+    if (attempt.quizId === id) learningStore().remove(`attempt:${attempt.id}`)
+  }
+  return loadSavedQuizzes()
 }
 
 // ---------------------------------------------------------------------------
@@ -598,40 +625,22 @@ export function deleteSavedQuiz(id: string): SavedQuiz[] {
 // ---------------------------------------------------------------------------
 
 export function loadAttempts(): QuizAttempt[] {
-  migrate()
-  const list = readJson(RESULTS_KEY, (value) => normalizeList(value, normalizeAttempt))
-  return list ?? []
+  return learningStore().list('attempt').flatMap((doc) => doc.type === 'attempt' ? [doc.value] : [])
 }
 
-function writeAttempts(attempts: QuizAttempt[]): boolean {
-  return writeJson(RESULTS_KEY, attempts)
-}
-
-/**
- * Append a completed attempt. Previous attempts are never overwritten, and
- * re-appending the same attempt id is a no-op so a repeated finish effect
- * can't double-record a run.
- */
+/** Completed attempts are immutable; repeating a finish cannot duplicate a run. */
 export function appendAttempt(attempt: QuizAttempt): QuizAttempt[] {
-  const attempts = loadAttempts()
-  if (attempts.some((a) => a.id === attempt.id)) return attempts
-  attempts.push(attempt)
-  writeAttempts(attempts)
-  return attempts
+  const value = normalizeAttempt(attempt)
+  if (value) learningStore().set(`attempt:${value.id}`, { type: 'attempt', value }, true)
+  return loadAttempts()
 }
 
 export function deleteAttempt(id: string): QuizAttempt[] {
-  const attempts = loadAttempts().filter((a) => a.id !== id)
-  writeAttempts(attempts)
-
-  // Don't leave a saved quiz pointing at an attempt that no longer exists.
-  const quizzes = loadSavedQuizzes()
-  if (quizzes.some((q) => q.lastAttemptId === id)) {
-    writeSavedQuizzes(
-      quizzes.map((q) => (q.lastAttemptId === id ? { ...q, lastAttemptId: undefined } : q)),
-    )
+  learningStore().remove(`attempt:${id}`)
+  for (const quiz of loadSavedQuizzes()) {
+    if (quiz.lastAttemptId === id) upsertSavedQuiz({ ...quiz, lastAttemptId: undefined })
   }
-  return attempts
+  return loadAttempts()
 }
 
 // ---------------------------------------------------------------------------
@@ -659,12 +668,10 @@ export function loadTheme(): Theme | null {
  */
 
 export function loadAppearance(): AppearancePrefs {
-  migrate()
   return readJson(APPEARANCE_KEY, normalizeAppearance) ?? defaultAppearance()
 }
 
 export function saveAppearance(prefs: AppearancePrefs): void {
-  migrate()
   writeJson(APPEARANCE_KEY, prefs)
 }
 
@@ -680,12 +687,10 @@ export function saveAppearance(prefs: AppearancePrefs): void {
  */
 
 export function loadSoundPrefs(): SoundPrefs {
-  migrate()
   return readJson(SOUND_KEY, normalizeSoundPrefs) ?? defaultSoundPrefs()
 }
 
 export function saveSoundPrefs(prefs: SoundPrefs): void {
-  migrate()
   writeJson(SOUND_KEY, prefs)
 }
 
@@ -700,12 +705,10 @@ export function saveSoundPrefs(prefs: SoundPrefs): void {
  */
 
 export function loadAIConfig(): AIConfig {
-  migrate()
   return readJson(AI_PREFS_KEY, normalizeAIConfig) ?? defaultAIConfig()
 }
 
 export function saveAIConfig(config: AIConfig): void {
-  migrate()
   writeJson(AI_PREFS_KEY, config)
 }
 
@@ -725,9 +728,4 @@ export function saveAIKey(key: string): void {
 
 export function clearAIKey(): void {
   removeRaw(AI_KEY_KEY)
-}
-
-/** Test helper: forget that migration already ran on this page. */
-export function resetMigrationForTests(): void {
-  migrated = false
 }

@@ -14,8 +14,9 @@ interface StartOptions {
  * Central quiz state machine.
  *
  * Owns the active session (questions, answers, position, timer) and keeps it
- * mirrored to localStorage so a page refresh restores the quiz exactly where
- * the user left off.
+ * mirrored through the storage service so a page refresh restores the quiz.
+ * Incoming sync updates do not replace a run the user is actively answering;
+ * the current database session is picked up on the next page load.
  */
 export function useQuiz() {
   // Lazy initializer: restore a previous session on first render.

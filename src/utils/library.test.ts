@@ -1,4 +1,6 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import PouchDB from 'pouchdb-browser'
+import type { LearningDatabase, StoredLearningDocument } from '../services/learningDatabase'
 import type { QuizAttempt, QuizQuestion, QuizSettings, SavedQuiz } from '../types/quiz'
 import { installMemoryStorage } from '../test/localStorageMock'
 import {
@@ -6,7 +8,8 @@ import {
   loadAttempts,
   loadSavedQuizzes,
   patchSavedQuiz,
-  resetMigrationForTests,
+  initializeStorage,
+  closeStorage,
   upsertSavedQuiz,
 } from '../services/storage'
 import {
@@ -61,9 +64,16 @@ function attemptWith(percentage: number, completedAt: number, id: string): QuizA
   }
 }
 
-beforeEach(() => {
+let database: LearningDatabase
+beforeEach(async () => {
   installMemoryStorage()
-  resetMigrationForTests()
+  database = new PouchDB<StoredLearningDocument>(`library-test-${crypto.randomUUID()}`, { adapter: 'idb' })
+  await initializeStorage({ database })
+})
+
+afterEach(async () => {
+  await closeStorage()
+  await new PouchDB(database.name).destroy()
 })
 
 describe('starting a saved quiz', () => {

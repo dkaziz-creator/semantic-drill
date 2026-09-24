@@ -25,4 +25,8 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    files: ['server/**/*.ts', 'vitest.server.config.ts'],
+    languageOptions: { globals: globals.node },
+  },
 )

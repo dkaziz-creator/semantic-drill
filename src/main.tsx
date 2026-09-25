@@ -1,27 +1,31 @@
 import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
+import { createRoot, type Root } from 'react-dom/client'
 import './index.css'
 import App from './App'
-import { initializeStorage, loadAppearance } from './services/storage'
+import { loadAppearance } from './services/storage'
+import { createStudyBootstrap } from './services/studyBootstrap'
 import { applyAppearance } from './utils/appearance'
 
-// Applied before the first render so the app never paints at the default font
-// size and then jumps. Deliberately not an inline script in index.html: that
-// would put a storage key outside services/storage.ts. `useAppearance` re-applies
-// the same values in its effect, which is a no-op.
+// Device appearance can be applied before authentication; learning data cannot.
 applyAppearance(document.documentElement, loadAppearance())
 
 const container = document.getElementById('root')!
-container.textContent = 'Loading saved quizzes…'
+let root: Root | undefined
 
-void initializeStorage({ remoteUrl: import.meta.env.VITE_COUCHDB_URL }).then(() => {
-  createRoot(container).render(
-    <StrictMode>
-      <App />
-    </StrictMode>,
-  )
-}).catch(() => {
-  // Never render an empty, uninitialized cache over an unreadable database.
-  // Keep the message independent of raw errors/URLs, which can contain secrets.
-  container.textContent = 'Saved quizzes could not be opened. Allow browser storage and reload to try again. Your stored data has not been cleared.'
-})
+// Future login code uses changeAccount; it must not change session cookies
+// first and leave the previous user's live replication attached to the gateway.
+export const studyApplication = createStudyBootstrap({
+  unmount() {
+    root?.unmount()
+    root = undefined
+  },
+  status(message) { container.textContent = message },
+  render(user) {
+    container.textContent = ''
+    root = createRoot(container)
+    root.render(<StrictMode><App key={user.id} /></StrictMode>)
+  },
+}, import.meta.env.VITE_LEARNING_SYNC_URL)
+
+// The bootstrap displays sanitized errors and never renders an unreadable cache.
+void studyApplication.reload().catch(() => undefined)

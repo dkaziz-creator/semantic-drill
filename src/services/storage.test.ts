@@ -21,7 +21,7 @@ import {
   loadSoundPrefs,
   loadTheme,
   patchSavedQuiz,
-  initializeStorage,
+  initializeLegacyStorage as initializeStorage,
   closeStorage,
   flushStorage,
   subscribeStorage,
@@ -937,9 +937,9 @@ describe('one-time learning-data import', () => {
     saveTheme('dark')
     saveAppearance({ font: 'serif', fontScale: 1.1, background: 'warm' })
     saveSoundPrefs({ enabled: false })
+    await initializeStorage({ database })
     saveAIConfig({ ...defaultAIConfig(), rememberKey: true })
     saveAIKey('test-only-device-secret')
-    await initializeStorage({ database })
     await flushStorage()
     const documents = await database.allDocs({ include_docs: true })
     expect(documents.rows.map((row) => row.id)).toEqual(['attempt:attempt_1', 'quiz:quiz_1', 'session:active'])
@@ -966,8 +966,8 @@ describe('optional native synchronization', () => {
     vi.stubGlobal('location', { href: 'https://example.test/quiz/' })
     vi.spyOn(console, 'warn').mockImplementation(() => undefined)
     const sync = vi.spyOn(database, 'sync').mockImplementation(() => { throw new Error('offline') })
-    await initializeStorage({ database, remoteUrl: '/couchdb/learning' })
-    expect(sync).toHaveBeenCalledWith(expect.objectContaining({ name: 'https://example.test/couchdb/learning' }), {
+    await initializeStorage({ database, remoteUrl: '/couchdb/my/' })
+    expect(sync).toHaveBeenCalledWith(expect.objectContaining({ name: 'https://example.test/couchdb/my/' }), {
       live: true, retry: true,
     })
     expect(upsertSavedQuiz(makeQuiz())).toEqual([makeQuiz()])
@@ -982,9 +982,9 @@ describe('optional native synchronization', () => {
     const replication = database.sync(peer, { live: true, retry: true })
     const sync = vi.spyOn(database, 'sync').mockReturnValue(replication)
     try {
+      await initializeStorage({ database, remoteUrl: 'https://example.test/couchdb/my/' })
       saveAIKey('test-only-device-secret')
-      await initializeStorage({ database, remoteUrl: 'https://example.test/couchdb/learning' })
-      expect(sync).toHaveBeenCalledWith(expect.objectContaining({ name: 'https://example.test/couchdb/learning' }), {
+      expect(sync).toHaveBeenCalledWith(expect.objectContaining({ name: 'https://example.test/couchdb/my/' }), {
         live: true, retry: true,
       })
       expect(upsertSavedQuiz(makeQuiz())).toEqual([makeQuiz()])

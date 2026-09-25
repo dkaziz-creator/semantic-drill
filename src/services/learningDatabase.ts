@@ -1,5 +1,6 @@
 import PouchDB from 'pouchdb-browser'
 import type { QuizAttempt, QuizSession, SavedQuiz } from '../types/quiz'
+import { canonicalUserId } from './userIdentity'
 
 export type LearningValue =
   | { type: 'quiz'; value: SavedQuiz }
@@ -15,11 +16,27 @@ export type StorageChange = LearningValue['type'] | 'status'
 // browser must import its own legacy data, even when other devices already did.
 const MIGRATION_ID = '_local/learning-localstorage-v1'
 
-export function openLearningDatabase(): LearningDatabase {
-  return new PouchDB<StoredLearningDocument>('semantic-drill-learning', {
+export function learningDatabaseName(userId: string): string {
+  return `semantic-drill-learning-${canonicalUserId(userId)}`
+}
+
+export function openLearningDatabase(userId: string): LearningDatabase {
+  return new PouchDB<StoredLearningDocument>(learningDatabaseName(userId), {
     adapter: 'idb',
     auto_compaction: true,
   })
+}
+
+/** The browser may select a gateway, never an underlying user database. */
+export function learningSyncUrl(remoteUrl: string): string {
+  const page = typeof location === 'undefined' ? undefined : location.href
+  const url = new URL(remoteUrl.trim(), page)
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash ||
+    !['/couchdb/my', '/couchdb/my/'].includes(url.pathname) || (page && url.origin !== new URL(page).origin)) {
+    throw new Error('Use the same-origin authenticated /couchdb/my/ gateway.')
+  }
+  url.pathname = '/couchdb/my/'
+  return url.href
 }
 
 function hasStatus(error: unknown, status: number): boolean {
@@ -37,9 +54,11 @@ export class LearningStore {
   private changes?: PouchDB.Core.Changes<StoredLearningDocument>
   private replication?: PouchDB.Replication.Sync<StoredLearningDocument>
   private remote?: LearningDatabase
+  private syncAbort?: AbortController
   private refreshing: Promise<void> = Promise.resolve()
   private lastOrder = 0
   private closed = false
+  private closing = false
   available = false
 
   constructor(
@@ -48,20 +67,23 @@ export class LearningStore {
     private notify: (type: StorageChange) => void,
   ) {}
 
-  async initialize(readLegacy: () => LearningDocument[] | null): Promise<void> {
-    try {
-      await this.database.get(MIGRATION_ID)
-    } catch (error) {
-      if (!hasStatus(error, 404)) throw error
-      const legacy = readLegacy()
-      // If localStorage is blocked, use IndexedDB but try the import again on
-      // a later startup. Never mark unreadable legacy data as migrated.
-      if (legacy !== null) {
-        for (const document of legacy) await this.persist(document._id, { document, insertOnly: true }, true)
-        try {
-          await this.database.put({ _id: MIGRATION_ID })
-        } catch (error) {
-          if (!hasStatus(error, 409)) throw error // another tab completed the same import
+  async initialize(readLegacy?: () => LearningDocument[] | null): Promise<void> {
+    // Study databases must never adopt unowned v1 data or migration markers.
+    if (readLegacy) {
+      try {
+        await this.database.get(MIGRATION_ID)
+      } catch (error) {
+        if (!hasStatus(error, 404)) throw error
+        const legacy = readLegacy()
+        // If localStorage is blocked, use IndexedDB but try the import again on
+        // a later startup. Never mark unreadable legacy data as migrated.
+        if (legacy !== null) {
+          for (const document of legacy) await this.persist(document._id, { document, insertOnly: true }, true)
+          try {
+            await this.database.put({ _id: MIGRATION_ID })
+          } catch (error) {
+            if (!hasStatus(error, 409)) throw error // another tab completed the same import
+          }
         }
       }
     }
@@ -93,6 +115,7 @@ export class LearningStore {
   }
 
   private accept(id: string, raw?: PouchDB.Core.ExistingDocument<StoredLearningDocument>): void {
+    if (this.closed || this.closing) return
     const previous = this.documents.get(id)
     const document = raw ? this.normalize(raw) : null
     if (document) {
@@ -119,6 +142,7 @@ export class LearningStore {
   }
 
   set(id: string, value: LearningValue, insertOnly = false): void {
+    if (this.closed || this.closing) throw new Error('Learning storage is closing.')
     if (insertOnly && this.documents.has(id)) return
     const order = this.documents.get(id)?.order ?? Math.max(Date.now(), this.lastOrder + 1)
     this.lastOrder = Math.max(this.lastOrder, order)
@@ -128,6 +152,7 @@ export class LearningStore {
   }
 
   remove(id: string): void {
+    if (this.closed || this.closing) throw new Error('Learning storage is closing.')
     this.documents.delete(id)
     this.enqueue(id, { document: null, insertOnly: false })
   }
@@ -140,6 +165,7 @@ export class LearningStore {
   }
 
   private setAvailable(value: boolean): void {
+    if (this.closed || this.closing) return
     if (this.available === value) return
     this.available = value
     this.notify('status')
@@ -195,34 +221,71 @@ export class LearningStore {
     }
   }
 
-  startSync(remoteUrl?: string): void {
-    if (!remoteUrl?.trim()) return
+  startSync(remoteUrl?: string, expectedUserId?: string): void {
+    if (!remoteUrl?.trim() || this.closed || this.closing || this.replication) return
     try {
-      const url = new URL(remoteUrl.trim(), typeof location === 'undefined' ? undefined : location.href)
-      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
-        throw new Error('Use a CouchDB database URL without credentials, query parameters or fragments.')
-      }
-      this.remote = new PouchDB<StoredLearningDocument>(url.href, { skip_setup: true })
+      const url = learningSyncUrl(remoteUrl)
+      const controller = new AbortController()
+      this.syncAbort = controller
+      const expectedUser = expectedUserId ? canonicalUserId(expectedUserId) : undefined
+      this.remote = new PouchDB<StoredLearningDocument>(url, {
+        skip_setup: true,
+        fetch: (input, options = {}) => {
+          const headers = new Headers(options.headers)
+          // A precondition, NOT a database selector: the future gateway must
+          // reject a mismatch with its session UUID, including when another
+          // browser tab changes the shared login cookie.
+          if (expectedUser) headers.set('X-Study-User', expectedUser)
+          // Revoke outstanding native HTTP requests before changing sessions.
+          return PouchDB.fetch(input, {
+            ...options,
+            headers,
+            signal: options.signal
+              ? AbortSignal.any([controller.signal, options.signal]) : controller.signal,
+          })
+        },
+      })
       this.replication = this.database.sync(this.remote, { live: true, retry: true })
-        .on('error', () => console.warn('Learning-data sync stopped; local storage remains available.'))
-        .on('denied', () => console.warn('The remote database denied a learning-data sync operation.'))
+        .on('error', () => {
+          if (!controller.signal.aborted) console.warn('Learning-data sync stopped; local storage remains available.')
+        })
+        .on('denied', () => {
+          if (!controller.signal.aborted) console.warn('The remote database denied a learning-data sync operation.')
+        })
     } catch {
-      // Do not log the URL or raw transport errors: a misconfigured URL may
-      // contain credentials. Optional sync must never prevent local startup.
-      console.warn('Learning-data sync could not start. Check VITE_COUCHDB_URL; local storage remains available.')
+      // Do not log URLs or raw errors: optional sync never blocks local use.
+      this.stopSync()
+      console.warn('Learning-data sync could not start. Check VITE_LEARNING_SYNC_URL; local storage remains available.')
     }
   }
 
-  async close(): Promise<void> {
-    this.closed = true
-    clearTimeout(this.retryTimer)
+  private stopSync(): void {
     this.replication?.cancel()
-    this.changes?.cancel()
-    await this.refreshing
+    this.syncAbort?.abort()
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return
+    this.closing = true
     try {
       await this.flush()
-    } finally {
+    } catch (error) {
+      // Retain the database and queued writes so shutdown can be retried. A
+      // failed flush must never silently lose data or activate another user.
+      this.closing = false
+      this.stopSync()
+      throw error
+    }
+    this.closed = true
+    clearTimeout(this.retryTimer)
+    this.stopSync()
+    this.changes?.cancel()
+    await this.refreshing
+    this.documents.clear()
+    this.available = false
+    try {
       await this.database.close()
+    } finally {
       await this.remote?.close()
     }
   }

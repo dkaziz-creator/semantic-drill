@@ -8,7 +8,7 @@ import {
   loadAttempts,
   loadSavedQuizzes,
   patchSavedQuiz,
-  initializeStorage,
+  initializeLegacyStorage as initializeStorage,
   closeStorage,
   upsertSavedQuiz,
 } from '../services/storage'

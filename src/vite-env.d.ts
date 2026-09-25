@@ -1,6 +1,8 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
-  /** Public CouchDB database endpoint; never put credentials in a Vite variable. */
-  readonly VITE_COUCHDB_URL?: string
+  /** Same-origin authenticated sync gateway; never a database name or secret. */
+  readonly VITE_LEARNING_SYNC_URL?: string
+  /** Trusted developer fixture, honored only by Vite's development mode. */
+  readonly VITE_DEV_USER_ID?: string
 }

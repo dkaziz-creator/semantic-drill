@@ -36,6 +36,9 @@ export function useBusyAction(): [boolean, (work: () => void) => void] {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         try {
+          // Account changes unmount the old tree before opening new storage.
+          // A queued action from that tree must never write into the new user.
+          if (!mountedRef.current) return
           work()
         } finally {
           pendingRef.current = false

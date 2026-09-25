@@ -9,6 +9,7 @@ import type {
   SavedQuizProgress,
 } from '../types/quiz'
 import type { SoundPrefs } from '../types/sound'
+import { canonicalUserId, userScopedKey } from './userIdentity'
 import { clampFontScale } from '../utils/appearance'
 import { normalizePassPercentage, normalizeQuestion } from '../utils/quiz'
 import { defaultSoundPrefs } from '../utils/sound'
@@ -133,7 +134,7 @@ function writeJson(key: string, value: unknown): boolean {
 
 /** Whether learning-data persistence is currently healthy (independent of preferences). */
 export function isStorageAvailable(): boolean {
-  return learning?.available ?? false
+  return ready && (learning?.available ?? false)
 }
 
 // ---------------------------------------------------------------------------
@@ -464,7 +465,16 @@ export function fingerprintQuestions(questions: QuizQuestion[]): string {
 // ---------------------------------------------------------------------------
 
 let learning: LearningStore | null = null
-let bootstrapping: Promise<void> | null = null
+let ready = false
+let activeScope: string | null = null
+let generation = 0
+let lifecycle: Promise<void> = Promise.resolve()
+let bootstrapping: {
+  scope: string
+  database?: LearningDatabase
+  remoteUrl?: string
+  promise: Promise<void>
+} | null = null
 const listeners = new Set<(type: StorageChange) => void>()
 
 /** Incoming database changes and persistence health, without exposing PouchDB to React. */
@@ -474,7 +484,7 @@ export function subscribeStorage(listener: (type: StorageChange) => void): () =>
 }
 
 function learningStore(): LearningStore {
-  if (!learning) throw new Error('Await initializeStorage() before using learning storage.')
+  if (!ready || !learning) throw new Error('Await initializeStorage() before using learning storage.')
   return learning
 }
 
@@ -526,47 +536,100 @@ export function migrate(): void {
   }
 }
 
-/** One shared bootstrap promise prevents concurrent callers from seeing a partial cache. */
-export function initializeStorage(options: { database?: LearningDatabase; remoteUrl?: string } = {}): Promise<void> {
-  if (bootstrapping) return bootstrapping
-  bootstrapping = (async () => {
-    const next = new LearningStore(options.database ?? openLearningDatabase(), normalizeDocument, (type) => {
+export interface StorageOptions {
+  userId: string
+  remoteUrl?: string
+}
+
+/** UUID validation precedes every database open. There is no anonymous fallback. */
+export function initializeStorage(options: StorageOptions): Promise<void> {
+  try {
+    return initializeScope(canonicalUserId(options.userId), options.remoteUrl)
+  } catch {
+    return Promise.reject(new Error('A valid internal user UUID is required.'))
+  }
+}
+
+/** Explicit v1 maintenance/test seam; the study bootstrap never calls this. */
+export function initializeLegacyStorage(options: { database: LearningDatabase; remoteUrl?: string }): Promise<void> {
+  return initializeScope('legacy', options.remoteUrl, options.database)
+}
+
+function invalidateStorage(): number {
+  ready = false
+  activeScope = null
+  bootstrapping = null
+  // Old hooks must not be notified by the next account's data. The bootstrap
+  // unmounts React before initiating the transition and mounts a fresh tree.
+  listeners.clear()
+  return ++generation
+}
+
+async function closeCurrent(): Promise<void> {
+  // If flushing fails, retain the store and its queue; the next transition
+  // retries shutdown and may not open a different database until it succeeds.
+  await learning?.close()
+  learning = null
+}
+
+function initializeScope(scope: string, remoteUrl?: string, database?: LearningDatabase): Promise<void> {
+  if (bootstrapping?.scope === scope && bootstrapping.database === database && bootstrapping.remoteUrl === remoteUrl) {
+    return bootstrapping.promise
+  }
+  const current = invalidateStorage()
+  const promise = lifecycle.then(async () => {
+    await closeCurrent()
+    if (current !== generation) return
+    const next = new LearningStore(database ?? openLearningDatabase(scope), normalizeDocument, (type) => {
+      // Includes delayed changes, status updates and pending refreshes from a
+      // previous store, even when a switch occurs while initialization awaits IO.
+      if (!ready || learning !== next || current !== generation) return
       for (const listener of listeners) listener(type)
     })
+    learning = next
     try {
       let imported = false
-      await next.initialize(() => {
+      await next.initialize(scope === 'legacy' ? () => {
         const legacy = readLegacyLearning()
         imported = legacy !== null
         return legacy
-      })
-      learning = next
+      } : undefined)
+      if (current !== generation) return // the queued transition closes this store
       if (imported) migrate()
-      next.startSync(options.remoteUrl)
+      activeScope = scope
+      ready = true
+      next.startSync(remoteUrl, scope === 'legacy' ? undefined : scope)
     } catch (error) {
-      await next.close().catch(() => undefined)
+      await closeCurrent()
       throw error
     }
-  })().catch((error: unknown) => {
-    bootstrapping = null
-    throw error
   })
-  return bootstrapping
+  bootstrapping = { scope, remoteUrl, database, promise }
+  lifecycle = promise.catch(() => {
+    if (current === generation) {
+      ready = false
+      activeScope = null
+      bootstrapping = null
+    }
+  })
+  return promise
 }
 
 export async function flushStorage(): Promise<void> {
   await learningStore().flush()
 }
 
-/** Close only after flushing pending writes; a later bootstrap reopens persisted data. */
-export async function closeStorage(): Promise<void> {
-  await bootstrapping?.catch(() => undefined)
-  try {
-    await learning?.close()
-  } finally {
-    learning = null
-    bootstrapping = null
-  }
+/** Unmount consumers first. Logout closes handles; it never destroys IndexedDB. */
+export function closeStorage(): Promise<void> {
+  invalidateStorage()
+  const promise = lifecycle.then(closeCurrent)
+  lifecycle = promise.catch(() => undefined)
+  return promise
+}
+
+function privatePreferenceKey(baseKey: string): string | null {
+  if (!ready || activeScope === null) return null
+  return activeScope === 'legacy' ? baseKey : userScopedKey(baseKey, activeScope)
 }
 
 // ---------------------------------------------------------------------------
@@ -705,11 +768,13 @@ export function saveSoundPrefs(prefs: SoundPrefs): void {
  */
 
 export function loadAIConfig(): AIConfig {
-  return readJson(AI_PREFS_KEY, normalizeAIConfig) ?? defaultAIConfig()
+  const key = privatePreferenceKey(AI_PREFS_KEY)
+  return (key ? readJson(key, normalizeAIConfig) : null) ?? defaultAIConfig()
 }
 
 export function saveAIConfig(config: AIConfig): void {
-  writeJson(AI_PREFS_KEY, config)
+  const key = privatePreferenceKey(AI_PREFS_KEY)
+  if (key) writeJson(key, config)
 }
 
 /**
@@ -718,14 +783,17 @@ export function saveAIConfig(config: AIConfig): void {
  * second-guess them, but nothing else in the app may call `saveAIKey`.
  */
 export function loadAIKey(): string | null {
-  const raw = readRaw(AI_KEY_KEY)
+  const key = privatePreferenceKey(AI_KEY_KEY)
+  const raw = key ? readRaw(key) : null
   return raw !== null && raw !== '' ? raw : null
 }
 
 export function saveAIKey(key: string): void {
-  writeRaw(AI_KEY_KEY, key)
+  const scopedKey = privatePreferenceKey(AI_KEY_KEY)
+  if (scopedKey) writeRaw(scopedKey, key)
 }
 
 export function clearAIKey(): void {
-  removeRaw(AI_KEY_KEY)
+  const key = privatePreferenceKey(AI_KEY_KEY)
+  if (key) removeRaw(key)
 }

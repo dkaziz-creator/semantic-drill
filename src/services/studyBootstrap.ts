@@ -6,6 +6,7 @@ interface StudyView {
   unmount(): void
   render(user: AuthenticatedUser): void
   status(message: string): void
+  signedOut?(): void
 }
 
 const STARTUP_ERROR = 'Study mode could not be opened. Verify your sign-in and browser storage, then retry. Your stored data has not been cleared.'
@@ -16,7 +17,7 @@ export function createStudyBootstrap(view: StudyView, remoteUrl?: string) {
   let queue: Promise<void> = Promise.resolve()
 
   /**
-   * Future login/logout must change the server session INSIDE this callback.
+   * Login/logout must change the server session INSIDE this callback.
    * React is unmounted and old writes/sync/handles are closed before it runs.
    * Returning null leaves the application signed out without deleting data.
    */
@@ -32,6 +33,7 @@ export function createStudyBootstrap(view: StudyView, remoteUrl?: string) {
       if (current !== revision) return
       if (resolved === null) {
         view.status('Signed out. Sign in to open your saved quizzes.')
+        view.signedOut?.()
         return
       }
       const user = { ...resolved, id: canonicalUserId(resolved.id) }

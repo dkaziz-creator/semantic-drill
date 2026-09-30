@@ -1,5 +1,7 @@
 # User-scoped study storage pilot
 
+> Historical notes for the preceding frontend storage iteration. The server, login UI, provisioning CLI, and gateway are now implemented; use [the current multi-user runbook](multi-user-auth.md) for configuration and acceptance checks. The storage design below remains relevant.
+
 This branch is based on `server-release`, not `server-collegues`. It implements
 browser storage isolation and the authentication/gateway seam. It does not
 implement the future authentication server, final login UI, database provisioner,

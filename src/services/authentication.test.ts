@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { getAuthenticatedUser } from './authentication'
+import { getAuthenticatedUser, signIn, signOut } from './authentication'
 
 const USER = '550e8400-e29b-41d4-a716-446655440000'
 const request = vi.fn<typeof fetch>()
@@ -34,7 +34,7 @@ describe('identity provider', () => {
   it('ignores development identity configuration in production', async () => {
     vi.stubEnv('VITE_DEV_USER_ID', USER)
     request.mockResolvedValue(new Response(null, { status: 401 }))
-    await expect(getAuthenticatedUser()).rejects.toThrow('Your study identity could not be verified.')
+    expect(await getAuthenticatedUser()).toBe(null)
     expect(request).toHaveBeenCalledOnce()
   })
 
@@ -46,5 +46,26 @@ describe('identity provider', () => {
   it('redacts transport details and rejects instead of falling back to shared storage', async () => {
     request.mockRejectedValue(new Error('https://private:secret@example.test'))
     await expect(getAuthenticatedUser()).rejects.toThrow('Your study identity could not be verified.')
+  })
+})
+
+
+describe('session mutation requests', () => {
+  it('sends same-origin credentials and never exposes server error details', async () => {
+    request.mockResolvedValue(new Response('private server details', { status: 401 }))
+    await expect(signIn('david', 'password')).rejects.toThrow('Invalid login or password.')
+    expect(request).toHaveBeenCalledWith('/api/auth/login', expect.objectContaining({
+      method: 'POST', credentials: 'same-origin', body: JSON.stringify({ login: 'david', password: 'password' }),
+    }))
+    request.mockResolvedValue(new Response(null, { status: 200 }))
+    expect(await signOut()).toBe(null)
+    expect(request).toHaveBeenLastCalledWith('/api/auth/logout', expect.objectContaining({ method: 'POST', credentials: 'same-origin' }))
+  })
+  it('treats service errors as failures, never as anonymous identities', async () => {
+    request.mockResolvedValue(new Response(null, { status: 503 }))
+    await expect(getAuthenticatedUser()).rejects.toThrow('could not be verified')
+    await expect(signOut()).rejects.toThrow('Sign-out could not be completed')
+    request.mockResolvedValue(new Response(null, { status: 429 }))
+    await expect(signIn('david', 'password')).rejects.toThrow('five minutes')
   })
 })

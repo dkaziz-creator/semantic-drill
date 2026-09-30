@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { ReactElement } from 'react'
 import { createRoot } from 'react-dom/client'
 import { closeStorage, initializeStorage } from './services/storage'
-import { getAuthenticatedUser } from './services/authentication'
+import { getAuthenticatedUser, signIn, signOut } from './services/authentication'
 
 vi.mock('react-dom/client', () => ({ createRoot: vi.fn() }))
 vi.mock('./App', () => ({ default: () => null }))
 vi.mock('./services/storage', () => ({ initializeStorage: vi.fn(), closeStorage: vi.fn(), loadAppearance: vi.fn() }))
-vi.mock('./services/authentication', () => ({ getAuthenticatedUser: vi.fn() }))
+vi.mock('./services/authentication', () => ({ getAuthenticatedUser: vi.fn(), signIn: vi.fn(), signOut: vi.fn() }))
 vi.mock('./utils/appearance', () => ({ applyAppearance: vi.fn() }))
 
 const USER_A = '550e8400-e29b-41d4-a716-446655440000'
@@ -83,8 +84,8 @@ describe('authenticated application startup', () => {
     expect(render).toHaveBeenCalledOnce()
     expect(container.textContent).not.toContain('secret-write-failure')
     await studyApplication.changeAccount(logout)
-    expect(container.textContent).toContain('Signed out')
-    expect(render).toHaveBeenCalledOnce()
+    expect(render).toHaveBeenCalledTimes(2)
+    expect((render.mock.lastCall![0] as ReactElement<{ children: ReactElement }>).props.children.type).toHaveProperty('name', 'StudyLogin')
   })
 
   it('suppresses a stale identity result when another account transition arrives', async () => {
@@ -101,4 +102,32 @@ describe('authenticated application startup', () => {
     expect(initializeStorage).toHaveBeenLastCalledWith({ userId: USER_B, remoteUrl: undefined })
     expect(render).toHaveBeenCalledTimes(2)
   })
+})
+
+
+it('opens login on 401 and drains storage before login and logout cookie mutations', async () => {
+  vi.mocked(getAuthenticatedUser).mockResolvedValueOnce(null)
+  const { studyApplication } = await import('./main')
+  await vi.waitFor(() => expect(render).toHaveBeenCalledOnce())
+  expect(initializeStorage).not.toHaveBeenCalled()
+  const screen = (render.mock.lastCall![0] as ReactElement<{ children: ReactElement<{ onSignIn: (login: string, password: string) => Promise<void> }> }>).props.children
+  expect(screen.type).toHaveProperty('name', 'StudyLogin')
+  let closed!: () => void
+  vi.mocked(closeStorage).mockReturnValueOnce(new Promise((resolve) => { closed = resolve }))
+  const signingIn = screen.props.onSignIn('david', 'test password')
+  expect(signIn).not.toHaveBeenCalled()
+  closed()
+  await signingIn
+  expect(signIn).toHaveBeenCalledWith('david', 'test password')
+  expect(initializeStorage).toHaveBeenCalledWith({ userId: USER_A, remoteUrl: undefined })
+  const account = (render.mock.lastCall![0] as ReactElement<{ children: ReactElement<{ onSignOut: () => Promise<void> }> }>).props.children
+  expect(account.type).toHaveProperty('name', 'StudyAccount')
+  vi.mocked(signOut).mockResolvedValue(null)
+  vi.mocked(closeStorage).mockReturnValueOnce(new Promise((resolve) => { closed = resolve }))
+  const signingOut = account.props.onSignOut()
+  expect(signOut).not.toHaveBeenCalled()
+  closed()
+  await signingOut
+  expect(signOut).toHaveBeenCalledOnce()
+  await studyApplication.reload()
 })

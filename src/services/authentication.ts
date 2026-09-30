@@ -1,7 +1,7 @@
 import { canonicalUserId, type AuthenticatedUser } from './userIdentity'
 
-/** Replace this provider when login is added; storage only consumes the UUID. */
-export async function getAuthenticatedUser(): Promise<AuthenticatedUser> {
+/** Identity comes from the session; 401 opens the sign-in shell. */
+export async function getAuthenticatedUser(): Promise<AuthenticatedUser | null> {
   try {
     // Explicit local development fixture only. Production never trusts a Vite
     // identity, a URL parameter, a display name, or a localStorage value.
@@ -14,6 +14,7 @@ export async function getAuthenticatedUser(): Promise<AuthenticatedUser> {
       redirect: 'error',
       headers: { Accept: 'application/json' },
     })
+    if (response.status === 401) return null
     if (!response.ok) throw new Error('Authentication unavailable.')
     const value: unknown = await response.json()
     if (typeof value !== 'object' || value === null || !('id' in value)) {
@@ -28,4 +29,29 @@ export async function getAuthenticatedUser(): Promise<AuthenticatedUser> {
     // Transport errors and server responses may contain private details.
     throw new Error('Your study identity could not be verified.')
   }
+}
+
+/** Call only inside studyApplication.changeAccount, after writes/sync close. */
+export async function signIn(login: string, password: string): Promise<void> {
+  let response: Response
+  try {
+    response = await fetch('/api/auth/login', {
+      method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ login, password }),
+    })
+  } catch { throw new Error('Sign-in is unavailable. Please try again.') }
+  if (response.status === 401) throw new Error('Invalid login or password.')
+  if (response.status === 429) throw new Error('Too many sign-in attempts. Please try again in five minutes.')
+  if (!response.ok) throw new Error('Sign-in is unavailable. Please try again.')
+}
+
+export async function signOut(): Promise<null> {
+  try {
+    const response = await fetch('/api/auth/logout', {
+      method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+    })
+    if (!response.ok) throw new Error()
+    return null
+  } catch { throw new Error('Sign-out could not be completed. Please retry.') }
 }

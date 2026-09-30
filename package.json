@@ -9,7 +9,13 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "typecheck:server": "tsc -p tsconfig.server.json --noEmit",
+    "build:server": "tsc -p tsconfig.server.json",
+    "test:server": "vitest run --config vitest.server.config.ts",
+    "test:server:integration": "STUDY_COUCHDB_INTEGRATION=1 node --env-file-if-exists=.env.couchdb-test node_modules/vitest/vitest.mjs run --config vitest.server.config.ts server/tests/real-couch.test.ts",
+    "server": "npm run build:server && node --env-file-if-exists=.env.server dist-server/index.js",
+    "create-study-user": "npm run build:server && node --env-file-if-exists=.env.server dist-server/scripts/create-user.js"
   },
   "dependencies": {
     "events": "^3.3.0",
@@ -33,6 +39,10 @@
     "typescript": "~5.8.3",
     "typescript-eslint": "^8.30.1",
     "vite": "^6.3.5",
-    "vitest": "^3.2.7"
+    "vitest": "^3.2.7",
+    "@types/node": "^22.20.4"
+  },
+  "engines": {
+    "node": ">=22.20.0"
   }
 }

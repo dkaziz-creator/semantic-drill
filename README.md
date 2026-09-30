@@ -1,5 +1,7 @@
 <div align="center">
 
+Multi-user study deployment (up to 50 users): see [session authentication and per-user CouchDB setup](docs/multi-user-auth.md) for server configuration, user provisioning, tests, and the two-device pilot checklist.
+
 <img src="src/assets/drillmcq-logo.png" alt="DrillMCQ" width="320" />
 
 <p><strong>Practice smarter. Test yourself.</strong></p>
@@ -173,7 +175,7 @@ A full run through the app, in the order you meet it.
 
 ### Prerequisites
 
-- Node.js 20+ and npm
+- Node.js 22.20+ and npm
 
 ### Installation
 
@@ -464,12 +466,13 @@ storage. Malformed configuration and remote failures leave local study usable.
 The browser never constructs a remote database name. The old `VITE_COUCHDB_URL`
 setting is no longer consumed; update configuration and rebuild.
 
-The next server iteration must authenticate the session, verify the request's
-expected-user precondition, and proxy native CouchDB requests into that session's
-`semantic-drill-user-<uuid>` database. The complete authentication backend, login
-UI, gateway, database provisioning and quiz distribution are **not included**.
-Production startup requires the documented `/api/auth/me` endpoint or a replacement
-trusted provider; the development fixture is ignored in production builds.
+The Node server now provides opaque cookie sessions, a minimal login screen,
+trusted CLI user provisioning, and the native streaming gateway. Every request
+resolves its session UUID and verifies `X-Study-User` before selecting that user's
+`semantic-drill-user-<uuid>` database. See [multi-user setup](docs/multi-user-auth.md)
+for local/HTTPS configuration and acceptance checks for up to 50 users. Quiz
+distribution remains out of scope; development identity fixtures are ignored in
+production builds.
 
 Account switching must go through the bootstrap's `changeAccount` boundary. It
 unmounts React, flushes local writes, cancels replication and outstanding HTTP
@@ -477,9 +480,10 @@ requests, closes the previous store, then resolves the new account and mounts a
 fresh tree. Cached data are never deleted on logout; a failed flush blocks the
 switch until it can be retried.
 
-See [the study pilot contract and runbook](docs/user-scoped-study.md) for identity
-setup, the exact localStorage inventory, gateway requirements, development
-instructions, tests, and the remaining two-user deployment prerequisites.
+See [multi-user authentication and deployment](docs/multi-user-auth.md) for user
+creation, server configuration, tests, and the two-device acceptance procedure.
+The [earlier storage pilot notes](docs/user-scoped-study.md) retain the detailed
+localStorage inventory and account-transition design.
 
 IndexedDB remains subject to browser quota/eviction; it is not a backup. Abrupt
 page termination can lose writes not yet committed. Large histories are loaded
@@ -492,7 +496,7 @@ a service worker or an offline authentication cache.
 DrillMCQ can use an AI model as a second opinion. It is **off by default and the
 app is fully usable without it** — every feature above works untouched.
 
-Because there is no backend, you bring your own API key: open ⚙️ **Settings** in
+AI requests go directly from the browser to your chosen provider using your own API key: open ⚙️ **Settings** in
 the header → **Configure AI assistant**, pick a provider (OpenAI, Google Gemini
 or Anthropic Claude), choose a model, paste your key, and hit **Test
 connection**. A green dot on the settings button means the assistant is

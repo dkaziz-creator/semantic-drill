@@ -9,5 +9,6 @@ export default defineConfig({
   // PouchDB imports the Node-compatible emitter; bundle its browser package.
   resolve: { alias: { events: 'events/' } },
   plugins: [react(), tailwindcss()],
-  test: { setupFiles: ['./src/test/indexedDBSetup.ts'] },
+  server: { proxy: { '/api/auth': 'http://127.0.0.1:3000', '/couchdb': 'http://127.0.0.1:3000' } },
+  test: { include: ['src/**/*.test.{ts,tsx}'], setupFiles: ['./src/test/indexedDBSetup.ts'] },
 })

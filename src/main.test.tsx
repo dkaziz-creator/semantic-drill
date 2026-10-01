@@ -2,12 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ReactElement } from 'react'
 import { createRoot } from 'react-dom/client'
 import { closeStorage, initializeStorage } from './services/storage'
-import { getAuthenticatedUser, signIn, signOut } from './services/authentication'
+import { changePassword, getAuthenticatedUser, getStudyAccess, signIn, signOut } from './services/authentication'
 
 vi.mock('react-dom/client', () => ({ createRoot: vi.fn() }))
 vi.mock('./App', () => ({ default: () => null }))
 vi.mock('./services/storage', () => ({ initializeStorage: vi.fn(), closeStorage: vi.fn(), loadAppearance: vi.fn() }))
-vi.mock('./services/authentication', () => ({ getAuthenticatedUser: vi.fn(), signIn: vi.fn(), signOut: vi.fn() }))
+vi.mock('./services/authentication', () => ({ changePassword: vi.fn(), getStudyAccess: vi.fn(), getAuthenticatedUser: vi.fn(), signIn: vi.fn(), signOut: vi.fn() }))
 vi.mock('./utils/appearance', () => ({ applyAppearance: vi.fn() }))
 
 const USER_A = '550e8400-e29b-41d4-a716-446655440000'
@@ -24,7 +24,9 @@ beforeEach(() => {
   vi.mocked(createRoot).mockReturnValue({ render, unmount })
   vi.mocked(closeStorage).mockResolvedValue()
   vi.mocked(initializeStorage).mockResolvedValue()
+  vi.mocked(getStudyAccess).mockResolvedValue({ id: USER_A })
   vi.mocked(getAuthenticatedUser).mockResolvedValue({ id: USER_A })
+  vi.mocked(signIn).mockResolvedValue('authenticated')
 })
 
 afterEach(() => vi.unstubAllGlobals())
@@ -33,7 +35,7 @@ describe('authenticated application startup', () => {
   it('resolves identity, then storage, before rendering React', async () => {
     let identify!: (user: { id: string }) => void
     let ready!: () => void
-    vi.mocked(getAuthenticatedUser).mockReturnValue(new Promise((resolve) => { identify = resolve }))
+    vi.mocked(getStudyAccess).mockReturnValue(new Promise((resolve) => { identify = resolve }))
     vi.mocked(initializeStorage).mockReturnValue(new Promise<void>((resolve) => { ready = resolve }))
     await import('./main')
     expect(initializeStorage).not.toHaveBeenCalled()
@@ -48,7 +50,7 @@ describe('authenticated application startup', () => {
   })
 
   it.each(['identity', 'storage'])('shows sanitized %s errors without rendering an empty app', async (stage) => {
-    vi.mocked(stage === 'identity' ? getAuthenticatedUser : initializeStorage)
+    vi.mocked(stage === 'identity' ? getStudyAccess : initializeStorage)
       .mockRejectedValue(new Error('test-only-sensitive-details'))
     await import('./main')
     await vi.waitFor(() => expect(container.textContent).toContain('could not be opened'))
@@ -106,7 +108,7 @@ describe('authenticated application startup', () => {
 
 
 it('opens login on 401 and drains storage before login and logout cookie mutations', async () => {
-  vi.mocked(getAuthenticatedUser).mockResolvedValueOnce(null)
+  vi.mocked(getStudyAccess).mockResolvedValueOnce(null)
   const { studyApplication } = await import('./main')
   await vi.waitFor(() => expect(render).toHaveBeenCalledOnce())
   expect(initializeStorage).not.toHaveBeenCalled()
@@ -130,4 +132,76 @@ it('opens login on 401 and drains storage before login and logout cookie mutatio
   await signingOut
   expect(signOut).toHaveBeenCalledOnce()
   await studyApplication.reload()
+})
+
+function lastScreen<P>() {
+  return (render.mock.lastCall![0] as ReactElement<{ children: ReactElement<P> }>).props.children
+}
+
+describe('first-login application lifecycle', () => {
+  it('restores the restricted screen at startup without opening local storage', async () => {
+    vi.mocked(getStudyAccess).mockResolvedValue({ mustChangePassword: true })
+    await import('./main')
+    await vi.waitFor(() => expect(render).toHaveBeenCalledOnce())
+    expect(lastScreen().type).toHaveProperty('name', 'StudyChangePassword')
+    expect(initializeStorage).not.toHaveBeenCalled()
+    expect(getAuthenticatedUser).not.toHaveBeenCalled()
+  })
+
+  it('transitions login → password change → existing App, draining storage before both cookie mutations', async () => {
+    vi.mocked(getStudyAccess).mockResolvedValueOnce(null)
+    vi.mocked(signIn).mockResolvedValue('password_change_required')
+    await import('./main')
+    await vi.waitFor(() => expect(render).toHaveBeenCalledOnce())
+    let closed!: () => void
+    vi.mocked(closeStorage).mockReturnValueOnce(new Promise((resolve) => { closed = resolve }))
+    const signingIn = lastScreen<{ onSignIn: (login: string, password: string) => Promise<void> }>()
+      .props.onSignIn('pilot', 'temporary password')
+    expect(signIn).not.toHaveBeenCalled()
+    closed()
+    await signingIn
+    expect(lastScreen().type).toHaveProperty('name', 'StudyChangePassword')
+    expect(initializeStorage).not.toHaveBeenCalled()
+    expect(getAuthenticatedUser).not.toHaveBeenCalled()
+    vi.mocked(closeStorage).mockReturnValueOnce(new Promise((resolve) => { closed = resolve }))
+    const changing = lastScreen<{ onChangePassword: (password: string) => Promise<void> }>()
+      .props.onChangePassword('permanent password')
+    expect(changePassword).not.toHaveBeenCalled()
+    expect(initializeStorage).not.toHaveBeenCalled()
+    closed()
+    await changing
+    expect(changePassword).toHaveBeenCalledWith('permanent password')
+    expect(initializeStorage).toHaveBeenCalledExactlyOnceWith({ userId: USER_A, remoteUrl: undefined })
+    expect(lastScreen<{ children: ReactElement }>().type).toHaveProperty('name', 'StudyAccount')
+    const { default: App } = await import('./App')
+    expect(lastScreen<{ children: ReactElement }>().props.children.type).toBe(App)
+  })
+
+  it('cancels the restricted session after storage closes and returns to login', async () => {
+    vi.mocked(getStudyAccess).mockResolvedValue({ mustChangePassword: true })
+    vi.mocked(signOut).mockResolvedValue(null)
+    await import('./main')
+    await vi.waitFor(() => expect(render).toHaveBeenCalledOnce())
+    let closed!: () => void
+    vi.mocked(closeStorage).mockReturnValueOnce(new Promise((resolve) => { closed = resolve }))
+    const cancelling = lastScreen<{ onSignOut: () => Promise<void> }>().props.onSignOut()
+    expect(signOut).not.toHaveBeenCalled()
+    closed()
+    await cancelling
+    expect(signOut).toHaveBeenCalledOnce()
+    expect(lastScreen().type).toHaveProperty('name', 'StudyLogin')
+    expect(initializeStorage).not.toHaveBeenCalled()
+  })
+
+  it.each([true, false])('recovers password-change failures using current auth state (restricted=%s)', async (restricted) => {
+    vi.mocked(getStudyAccess).mockResolvedValueOnce({ mustChangePassword: true })
+    vi.mocked(changePassword).mockRejectedValue(new Error('Password change could not be completed.'))
+    await import('./main')
+    await vi.waitFor(() => expect(render).toHaveBeenCalledOnce())
+    vi.mocked(getStudyAccess).mockResolvedValue(restricted ? { mustChangePassword: true } : null)
+    await lastScreen<{ onChangePassword: (password: string) => Promise<void> }>().props.onChangePassword('new password')
+    expect(lastScreen().type).toHaveProperty('name', restricted ? 'StudyChangePassword' : 'StudyLogin')
+    expect(lastScreen<{ error: string }>().props.error).toContain('Password change could not be completed')
+    expect(initializeStorage).not.toHaveBeenCalled()
+  })
 })

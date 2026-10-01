@@ -11,6 +11,8 @@ export interface User {
   displayName: string
   enabled: boolean
   provisioned: boolean
+  // Missing on pre-first-login pilot accounts; those retain permanent passwords.
+  mustChangePassword?: boolean
   password: PasswordHash
   createdAt: string
 }

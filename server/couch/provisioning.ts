@@ -28,7 +28,7 @@ export async function provisionUser(couch: CouchClient, input: {
     if (!input.displayName?.trim() || input.displayName.trim().length > 100) throw new Error('A display name of 1–100 characters is required.')
     user = {
       _id: `login:${login}`, type: 'user', userId: randomUUID(), login,
-      displayName: input.displayName.trim(), enabled: false, provisioned: false,
+      displayName: input.displayName.trim(), enabled: false, provisioned: false, mustChangePassword: true,
       password: await hashPassword(input.password ?? ''), createdAt: new Date().toISOString(),
     }
     const result = await couch.put(AUTH_DATABASE, user._id, user)

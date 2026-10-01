@@ -26,6 +26,12 @@ beforeEach(async () => {
   couch = new CouchClient(testConfig(await listen(fake.server)))
   a = await provisionUser(couch, { login: 'david-test', displayName: 'David', password: PASSWORD })
   b = await provisionUser(couch, { login: 'alex-test', displayName: 'Alex', password: PASSWORD })
+  // Existing authentication/gateway regression cases use permanent-password users.
+  // Fresh provisioning and the restricted transition are covered separately.
+  for (const user of [a, b]) {
+    user.mustChangePassword = false
+    user._rev = (await couch.put(AUTH_DATABASE, user._id, user)).rev
+  }
   logs = []
   server = createStudyServer(couch.config, { log: (entry) => logs.push(entry) })
   base = await listen(server)
@@ -38,7 +44,7 @@ async function login(user = a, password = PASSWORD) {
     body: JSON.stringify({ login: user.login, password }) })
   return { response, cookie: response.headers.get('set-cookie')?.split(';')[0] ?? '' }
 }
-async function session(user: User) { return `study_session=${await createSession(couch, user, 3600)}` }
+async function session(user: User) { return `study_session=${await createSession(couch, user, 'study', 3600)}` }
 function gateway(user: User, cookie: string, path: string, method = 'GET', body?: string) {
   return fetch(base + '/couchdb/my/' + path, { method, body,
     headers: { Cookie: cookie, 'X-Study-User': user.userId, 'Content-Type': 'application/json', Origin: couch.config.publicOrigin } })
@@ -69,28 +75,29 @@ describe('provisioning and sessions', () => {
     const resumed = await provisionUser(couch, { login: a.login, resume: true })
     expect(resumed.userId).toBe(a.userId)
     expect(resumed.password).toEqual(a.password)
+    expect(resumed.mustChangePassword).toBe(a.mustChangePassword)
     expect(resumed.enabled).toBe(true)
   })
   it('stores only hashes of distinct 256-bit tokens; expires/revokes/disables correctly', async () => {
-    const token = await createSession(couch, a, 60)
-    const second = await createSession(couch, a, 60)
+    const token = await createSession(couch, a, 'study', 60)
+    const second = await createSession(couch, a, 'study', 60)
     expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/)
     expect(Buffer.from(token, 'base64url').length).toBe(32)
     expect(token).not.toBe(second)
     const stored = fake.databases.get(AUTH_DATABASE)!.get(sessionId(token)!)!
     expect(JSON.stringify(stored)).not.toContain(token)
-    expect(await resolveSession(couch, token)).toMatchObject({ userId: a.userId })
-    expect(await resolveSession(couch, token, Date.now() + 61000)).toBe(null)
+    expect(await resolveSession(couch, token, 'study')).toMatchObject({ userId: a.userId })
+    expect(await resolveSession(couch, token, 'study', Date.now() + 61000)).toBe(null)
     await revokeSession(couch, token)
-    expect(await resolveSession(couch, token)).toBe(null)
+    expect(await resolveSession(couch, token, 'study')).toBe(null)
     await revokeSession(couch, token)
     fake.databases.get(AUTH_DATABASE)!.get(a._id)!.enabled = false
-    expect(await resolveSession(couch, second)).toBe(null)
+    expect(await resolveSession(couch, second, 'study')).toBe(null)
   })
   it('rejects a session whose UUID no longer matches its login record', async () => {
-    const token = await createSession(couch, a, 60)
+    const token = await createSession(couch, a, 'study', 60)
     fake.databases.get(AUTH_DATABASE)!.get(a._id)!.userId = b.userId
-    expect(await resolveSession(couch, token)).toBe(null)
+    expect(await resolveSession(couch, token, 'study')).toBe(null)
   })
 })
 
@@ -98,7 +105,7 @@ describe('authentication API', () => {
   it('returns only public identity, sets secure cookie, rotates sessions, and logs no secrets', async () => {
     const { response, cookie } = await login()
     expect(response.status).toBe(200)
-    expect(await response.json()).toEqual({ id: a.userId, displayName: 'David' })
+    expect(await response.json()).toEqual({ status: 'authenticated', user: { id: a.userId, displayName: 'David' } })
     expect(response.headers.get('set-cookie')).toMatch(/HttpOnly; SameSite=Strict; Path=\/; Max-Age=604800; Secure/)
     const me = await fetch(base + '/api/auth/me', { headers: { Cookie: cookie } })
     expect(me.status).toBe(200)
@@ -135,7 +142,7 @@ describe('authentication API', () => {
   })
   it('enforces same-origin on login/logout/mutations and bounds input', async () => {
     const cookie = await session(a)
-    for (const path of ['/api/auth/login', '/api/auth/logout', '/couchdb/my/_bulk_docs']) {
+    for (const path of ['/api/auth/login', '/api/auth/logout', '/api/auth/change-password', '/couchdb/my/_bulk_docs']) {
       const response = await fetch(base + path, { method: 'POST', headers: { Cookie: cookie, Origin: 'https://evil.example' } })
       expect(response.status).toBe(403)
     }
@@ -236,10 +243,13 @@ it('keeps a partially provisioned account disabled until a successful resume', a
   const saved = fake.databases.get(AUTH_DATABASE)!.get('login:charlie-test')!
   expect(saved.enabled).toBe(false)
   expect(saved.provisioned).toBe(false)
+  expect(saved.mustChangePassword).toBe(true)
   expect((await login({ ...a, login: 'charlie-test' })).response.status).toBe(401)
   fake.faults.userSecurity = false
   const resumed = await provisionUser(couch, { login: 'charlie-test', resume: true })
   expect(resumed.userId).toBe(saved.userId)
+  expect(resumed.password).toEqual(saved.password)
+  expect(resumed.mustChangePassword).toBe(true)
   expect(resumed.enabled).toBe(true)
 })
 

@@ -16,6 +16,7 @@ describe.skipIf(process.env.STUDY_COUCHDB_INTEGRATION !== '1')('real CouchDB gat
   let base: string
   const users: User[] = []
   const cookies: string[] = []
+  const restrictedCookies: string[] = []
   const password = 'integration-only-password-' + randomUUID()
 
   beforeAll(async () => {
@@ -34,7 +35,24 @@ describe.skipIf(process.env.STUDY_COUCHDB_INTEGRATION !== '1')('real CouchDB gat
       const response = await fetch(base + '/api/auth/login', { method: 'POST',
         headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ login: user.login, password }) })
       expect(response.status).toBe(200)
-      cookies.push(response.headers.get('set-cookie')!.split(';')[0]!)
+      expect(await response.json()).toEqual({ status: 'password_change_required' })
+      const restricted = response.headers.get('set-cookie')!.split(';')[0]!
+      restrictedCookies.push(restricted)
+      expect((await fetch(base + '/api/auth/me', { headers: { Cookie: restricted } })).status).toBe(401)
+      expect((await fetch(base + '/couchdb/my/_all_docs', {
+        headers: { Cookie: restricted, 'X-Study-User': user.userId },
+      })).status).toBe(401)
+      const changed = await fetch(base + '/api/auth/change-password', { method: 'POST', headers: {
+        Cookie: restricted, Origin: config.publicOrigin, 'Content-Type': 'application/json',
+      }, body: JSON.stringify({ password: 'permanent-' + password }) })
+      expect(changed.status).toBe(200)
+      expect(await changed.json()).toEqual({ status: 'authenticated', user: { id: user.userId, displayName: user.displayName } })
+      const study = changed.headers.get('set-cookie')!.split(';')[0]!
+      cookies.push(study)
+      expect(study).not.toBe(restricted)
+      expect((await fetch(base + '/api/auth/me', { headers: { Cookie: study } })).status).toBe(200)
+      expect((await fetch(base + '/api/auth/me', { headers: { Cookie: restricted } })).status).toBe(401)
+      expect((await couch.get<User>(AUTH_DATABASE, user._id))?.mustChangePassword).toBe(false)
     }
   })
 
@@ -42,7 +60,7 @@ describe.skipIf(process.env.STUDY_COUCHDB_INTEGRATION !== '1')('real CouchDB gat
     if (server) await close(server)
     // Clean only the UUID DBs and auth records created by this run; never drop auth DB.
     for (const user of users) await couch.request('DELETE', `/${userDatabase(user.userId)}`)
-    for (const id of [...users.map((u) => u._id), ...cookies.map((c) => sessionId(c.slice('study_session='.length))!)]) {
+    for (const id of [...users.map((u) => u._id), ...[...cookies, ...restrictedCookies].map((c) => sessionId(c.slice('study_session='.length))!)]) {
       const doc = await couch.get<{ _rev: string }>(AUTH_DATABASE, id)
       if (doc) await couch.request('DELETE', `/${AUTH_DATABASE}/${encodeURIComponent(id)}?rev=${encodeURIComponent(doc._rev)}`)
     }

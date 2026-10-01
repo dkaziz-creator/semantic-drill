@@ -1,4 +1,4 @@
-import { getAuthenticatedUser } from './authentication'
+import { getStudyAccess, type StudyAccess } from './authentication'
 import { closeStorage, initializeStorage } from './storage'
 import { canonicalUserId, type AuthenticatedUser } from './userIdentity'
 
@@ -7,6 +7,7 @@ interface StudyView {
   render(user: AuthenticatedUser): void
   status(message: string): void
   signedOut?(): void
+  passwordChangeRequired(): void
 }
 
 const STARTUP_ERROR = 'Study mode could not be opened. Verify your sign-in and browser storage, then retry. Your stored data has not been cleared.'
@@ -17,11 +18,11 @@ export function createStudyBootstrap(view: StudyView, remoteUrl?: string) {
   let queue: Promise<void> = Promise.resolve()
 
   /**
-   * Login/logout must change the server session INSIDE this callback.
+   * Login/logout/password changes must change the server session INSIDE this callback.
    * React is unmounted and old writes/sync/handles are closed before it runs.
    * Returning null leaves the application signed out without deleting data.
    */
-  function changeAccount(authenticate: () => Promise<AuthenticatedUser | null>): Promise<void> {
+  function changeAccount(authenticate: () => Promise<StudyAccess>): Promise<void> {
     const current = ++revision
     view.unmount()
     view.status('Loading saved quizzes…')
@@ -34,6 +35,10 @@ export function createStudyBootstrap(view: StudyView, remoteUrl?: string) {
       if (resolved === null) {
         view.status('Signed out. Sign in to open your saved quizzes.')
         view.signedOut?.()
+        return
+      }
+      if ('mustChangePassword' in resolved) {
+        view.passwordChangeRequired()
         return
       }
       const user = { ...resolved, id: canonicalUserId(resolved.id) }
@@ -50,6 +55,6 @@ export function createStudyBootstrap(view: StudyView, remoteUrl?: string) {
 
   return {
     changeAccount,
-    reload: () => changeAccount(getAuthenticatedUser),
+    reload: () => changeAccount(getStudyAccess),
   }
 }
